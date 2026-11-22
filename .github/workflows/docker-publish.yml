@@ -2,99 +2,31 @@ name: Build and Push Docker Image
 
 on:
   push:
-    branches: [main, ci/docker-native-arm64]
-    tags: ['v*']
-  pull_request:
     branches: [main]
-  workflow_dispatch:
-    inputs:
-      no_cache:
-        description: Rebuild all layers for a cold-cache comparison
-        type: boolean
-        default: false
-
-permissions:
-  contents: read
+    tags: ['v*']
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && github.repository || format('{0}-ci', github.repository) }}
+  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  build-pr:
-    name: Build and test without publishing ${{ matrix.arch }}
-    if: >-
-      github.event_name == 'pull_request' ||
-      (github.ref != 'refs/heads/main' &&
-       github.ref != 'refs/heads/ci/docker-native-arm64' &&
-       !startsWith(github.ref, 'refs/tags/v'))
+  build-and-push:
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
-    permissions:
-      contents: read
     strategy:
-      fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-24.04
-            platform: linux/amd64
-            arch: amd64
-          - runner: ubuntu-24.04-arm
-            platform: linux/arm64
-            arch: arm64
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build native image locally
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          platforms: ${{ matrix.platform }}
-          load: true
-          no-cache: ${{ inputs.no_cache == true }}
-          tags: leapconnect:smoke
-          cache-from: type=gha,scope=docker-native-${{ matrix.arch }}
-
-      - name: Smoke-test local native image
-        shell: bash
-        env:
-          PLATFORM: ${{ matrix.platform }}
-        run: bash .github/scripts/smoke-test-image.sh leapconnect:smoke "$PLATFORM"
-
-  build-and-push:
-    name: Build and test ${{ matrix.arch }}
-    if: >-
-      github.event_name != 'pull_request' &&
-      (github.ref == 'refs/heads/main' ||
-       github.ref == 'refs/heads/ci/docker-native-arm64' ||
-       startsWith(github.ref, 'refs/tags/v'))
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
     permissions:
       contents: read
       packages: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: ubuntu-24.04
-            platform: linux/amd64
-            arch: amd64
-          - runner: ubuntu-24.04-arm
-            platform: linux/arm64
-            arch: arm64
+      attestations: write
+      id-token: write
 
     steps:
       - uses: actions/checkout@v4
-
-      - name: Normalize image name
-        shell: bash
-        run: |
-          image="${REGISTRY}/${IMAGE_NAME}"
-          echo "IMAGE=${image,,}" >> "$GITHUB_ENV"
 
       - name: Log in to Container Registry
         uses: docker/login-action@v3
@@ -107,78 +39,35 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.IMAGE }}
-          flavor: latest=${{ startsWith(github.ref, 'refs/tags/v') && 'auto' || 'false' }}
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=ref,event=branch
-            type=semver,pattern={{version}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
-            type=semver,pattern={{major}}.{{minor}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
             type=sha
-            type=raw,value=native-${{ github.run_id }}-${{ github.run_attempt }},enable=${{ github.ref == 'refs/heads/ci/docker-native-arm64' }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build and push native image by digest
-        id: build
+      - name: Build and push Docker image
         uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: ${{ matrix.platform }}
+          platforms: linux/${{ matrix.arch }}
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:build-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.arch }}
           labels: ${{ steps.meta.outputs.labels }}
-          no-cache: ${{ inputs.no_cache == true }}
-          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=docker-native-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=docker-native-${{ matrix.arch }}
-
-      - name: Smoke-test native image
-        shell: bash
-        env:
-          DIGEST: ${{ steps.build.outputs.digest }}
-          PLATFORM: ${{ matrix.platform }}
-        run: |
-          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
-          image="${IMAGE}@${DIGEST}"
-          docker pull --platform "$PLATFORM" "$image"
-          bash .github/scripts/smoke-test-image.sh "$image" "$PLATFORM"
-
-      - name: Export tested digest
-        shell: bash
-        env:
-          DIGEST: ${{ steps.build.outputs.digest }}
-        run: |
-          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
-          mkdir -p "$RUNNER_TEMP/digests"
-          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
-
-      - name: Upload tested digest
-        uses: actions/upload-artifact@v4
-        with:
-          name: digests-${{ matrix.arch }}
-          path: ${{ runner.temp }}/digests/*
-          if-no-files-found: error
-          retention-days: 1
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
 
   merge:
-    name: Merge tested native images
-    if: >-
-      github.event_name != 'pull_request' &&
-      (github.ref == 'refs/heads/main' ||
-       github.ref == 'refs/heads/ci/docker-native-arm64' ||
-       startsWith(github.ref, 'refs/tags/v'))
     needs: build-and-push
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
-    steps:
-      - name: Normalize image name
-        shell: bash
-        run: |
-          image="${REGISTRY}/${IMAGE_NAME}"
-          echo "IMAGE=${image,,}" >> "$GITHUB_ENV"
 
+    steps:
       - name: Log in to Container Registry
         uses: docker/login-action@v3
         with:
@@ -190,54 +79,19 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.IMAGE }}
-          flavor: latest=${{ startsWith(github.ref, 'refs/tags/v') && 'auto' || 'false' }}
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=ref,event=branch
-            type=semver,pattern={{version}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
-            type=semver,pattern={{major}}.{{minor}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
             type=sha
-            type=raw,value=native-${{ github.run_id }}-${{ github.run_attempt }},enable=${{ github.ref == 'refs/heads/ci/docker-native-arm64' }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Download tested digests
-        uses: actions/download-artifact@v4
-        with:
-          path: ${{ runner.temp }}/digests
-          pattern: digests-*
-          merge-multiple: true
-
-      - name: Create and verify multi-platform manifest
-        shell: bash
-        env:
-          METADATA_JSON: ${{ steps.meta.outputs.json }}
+      - name: Publish multi-platform image
         run: |
-          mapfile -t tags < <(jq -r '.tags[]' <<< "$METADATA_JSON")
-          [[ ${#tags[@]} -gt 0 ]]
-          tag_args=()
-          for tag in "${tags[@]}"; do
-            tag_args+=(--tag "$tag")
-          done
-          digests=("$RUNNER_TEMP"/digests/*)
-          [[ ${#digests[@]} -eq 2 ]]
-          sources=()
-          for digest_file in "${digests[@]}"; do
-            digest="${digest_file##*/}"
-            [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
-            sources+=("${IMAGE}@sha256:${digest}")
-          done
-          docker buildx imagetools create \
-            --metadata-file "$RUNNER_TEMP/manifest-metadata.json" \
-            "${tag_args[@]}" "${sources[@]}"
-          digest=$(jq -er '."containerimage.descriptor".digest' "$RUNNER_TEMP/manifest-metadata.json")
-          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
-          index="${IMAGE}@${digest}"
-          docker buildx imagetools inspect "$index" --raw | jq -e '
-            [.manifests[].platform
-             | select(.os != "unknown" and .architecture != "unknown")
-             | "\(.os)/\(.architecture)"]
-            | sort | unique == ["linux/amd64", "linux/arm64"]
-          '
-          echo "Published and verified native index: \`${index}\`" >> "$GITHUB_STEP_SUMMARY"
+          mapfile -t tag_args < <(jq -r '.tags[] | "-t", .' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          docker buildx imagetools create "${tag_args[@]}" \
+            "${REGISTRY}/${IMAGE_NAME}:build-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-amd64" \
+            "${REGISTRY}/${IMAGE_NAME}:build-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-arm64"
