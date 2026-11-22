@@ -17,7 +17,7 @@ cleanup() {
     docker logs "$container" >&2 || true
   fi
   docker rm -fv "$container" >/dev/null 2>&1 || true
-  rm -rf "$test_dir"
+  rm -rf "$test_dir" || true
   exit "$result"
 }
 trap cleanup EXIT
@@ -59,12 +59,14 @@ import sys
 with open(sys.argv[1]) as response:
     html = response.read()
 assert '<div id="app">' in html, "Frontend root missing"
-match = re.search(r'src="(/assets/[^\"]+\.js)"', html)
+match = re.search(r'src="((?:\./|/)assets/[^\"]+\.js)"', html)
 assert match, "Built frontend JavaScript missing"
-print(match.group(1))
+print("/" + match.group(1).removeprefix("./").lstrip("/"))
 PY
 )
-curl --fail --silent --show-error --max-time 10 "$url$asset" -o "$test_dir/asset.js"
+curl --fail --silent --show-error --max-time 10 "$url$asset" \
+  -D "$test_dir/asset.headers" -o "$test_dir/asset.js"
+grep -Eiq '^content-type: (application|text)/(javascript|x-javascript)' "$test_dir/asset.headers"
 [[ -s "$test_dir/asset.js" ]]
 docker exec "$container" /app/.venv/bin/python -c \
   'import platform, sys; assert platform.machine() == sys.argv[1], platform.machine()' "$machine"
