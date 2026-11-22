@@ -1,25 +1,73 @@
-name: Build and Push Docker Image
+name: Build and Push Docker Image (QEMU)
 
 on:
   push:
-    branches: [main]
+    branches: [main, ci/docker-qemu]
     tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  IMAGE_NAME: ${{ github.repository }}${{ github.ref == 'refs/heads/ci/docker-qemu' && '-ci' || '' }}
 
 jobs:
+  # Keep PRs (including same-repository PRs) out of the package-write job.
+  build-only:
+    if: >-
+      github.event_name == 'pull_request' ||
+      (github.ref != 'refs/heads/main' &&
+       github.ref != 'refs/heads/ci/docker-qemu' &&
+       !startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image without publishing
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: false
+          cache-from: type=gha,scope=docker-qemu
+
   build-and-push:
-    runs-on: ubuntu-latest
+    if: >-
+      github.event_name != 'pull_request' &&
+      (github.ref == 'refs/heads/main' ||
+       github.ref == 'refs/heads/ci/docker-qemu' ||
+       startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
     permissions:
       contents: read
       packages: write
-      attestations: write
-      id-token: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+      image: ${{ steps.image.outputs.ref }}
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Normalize image reference
+        id: image
+        shell: bash
+        run: |
+          image="${REGISTRY}/${IMAGE_NAME}"
+          echo "ref=${image,,}" >> "$GITHUB_OUTPUT"
 
       - name: Log in to Container Registry
         uses: docker/login-action@v3
@@ -32,22 +80,89 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ steps.image.outputs.ref }}
+          flavor: |
+            latest=${{ github.ref == 'refs/heads/ci/docker-qemu' && 'false' || 'auto' }}
           tags: |
             type=ref,event=branch
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{version}},enable=${{ github.ref != 'refs/heads/ci/docker-qemu' }}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ github.ref != 'refs/heads/ci/docker-qemu' }}
             type=sha
+            type=raw,value=qemu-${{ github.run_id }}-${{ github.run_attempt }},enable=${{ github.ref == 'refs/heads/ci/docker-qemu' }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      - name: Record build start time
+        run: echo "BUILD_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
+
       - name: Build and push Docker image
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=docker-qemu
+          cache-to: type=gha,mode=max,scope=docker-qemu
+
+      - name: Summarize published image
+        env:
+          IMAGE: ${{ steps.image.outputs.ref }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          echo "### QEMU multi-platform build" >> "$GITHUB_STEP_SUMMARY"
+          echo "Published: \`${IMAGE}@${DIGEST}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Build and push elapsed: $(( $(date +%s) - BUILD_STARTED_AT )) seconds (approximate)." >> "$GITHUB_STEP_SUMMARY"
+          echo 'Platforms: linux/amd64, linux/arm64. Compare the build step duration and total workflow duration.' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify published index platforms
+        env:
+          IMAGE: ${{ steps.image.outputs.ref }}@${{ steps.build.outputs.digest }}
+        run: |
+          docker buildx imagetools inspect --raw "$IMAGE" | jq -e '
+            [.manifests[].platform | "\(.os)/\(.architecture)"]
+            | contains(["linux/amd64", "linux/arm64"])
+          '
+
+  smoke-test:
+    needs: build-and-push
+    if: needs.build-and-push.outputs.digest != ''
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
+    env:
+      IMAGE: ${{ needs.build-and-push.outputs.image }}@${{ needs.build-and-push.outputs.digest }}
+      PLATFORM: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull exact published index digest
+        run: docker pull --platform "$PLATFORM" "$IMAGE"
+
+      - name: Smoke-test image on native architecture
+        run: bash .github/scripts/smoke-test-image.sh "$IMAGE" "$PLATFORM"

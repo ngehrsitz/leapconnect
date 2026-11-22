@@ -93,6 +93,10 @@ LeapConnect is an independent, community-driven project (see the [disclaimer](#d
 
 ### Using the pre-built image
 
+Images support `linux/amd64` and `linux/arm64`; Docker selects the matching
+architecture automatically. A Raspberry Pi 3 requires a **64-bit OS**, such as
+Raspberry Pi OS (64-bit). These images do not support 32-bit Raspberry Pi OS.
+
 ```bash
 docker pull ghcr.io/markoceri/leapconnect:latest
 ```
