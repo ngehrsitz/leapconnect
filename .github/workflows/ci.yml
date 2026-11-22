@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, ci/docker-native-arm64]
   pull_request:
     branches: [main]
 
